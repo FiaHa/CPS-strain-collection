@@ -1,0 +1,823 @@
+---
+title: "Binomial Proportion model"
+author: "David Kent (dk657)"
+date: "January 9, 2018"
+output:
+  md_document:
+    toc: true
+---
+
+```{r echo=F, message=F, warning=F}
+options(scipen=100,digits=2)
+library(glmmTMB)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(lme4)
+#library(nlme) # check that estimates match
+#library(GAMM) # check that estimates match
+library(knitr)
+library(kableExtra)
+```
+
+Read in data:
+
+```{r, warning=F}
+san <- read.csv("SummarySanitizer_2018705.csv") %>%
+  mutate(Trial=as.factor(Trial),
+         PAA=PAA*10.1/10,
+         prop=Control/PAA,
+         reduc=log10(Control/PAA),
+         PAA_v=.1/10.1/10^DilutionP) %>%
+  mutate(PAA_detect=1/PAA_v) %>%
+  mutate(sanity=ifelse(PAA==0,TRUE,PAA>=PAA_detect),
+         right_censored=ifelse(prop==Inf,"censored","not_censored"),
+         right_censor_limit_prop=Control/PAA_detect,
+         right_censor_limit_reduc=log10(Control/PAA_detect),
+         PAA=round(PAA,digits = 0))
+```
+
+# Listeria model
+
+```{r}
+l_data <- san %>%
+  filter(Strain!="FSL C2-0008") %>% # remove surrogate?
+  filter(PathogenGroup=="Listeria monocytogenes")
+l_data_w_surrogate <- san %>%
+  filter(PathogenGroup=="Listeria monocytogenes")
+```
+
+## Fit binomial proportion model
+
+We'll fit a crossed random-effects log-link binomial proportion model (with OLRE
+to correct for overdispersion) to the response
+$\log(N_{\text{san}}/N_{\text{cont}})$, the negative of which is our
+"log-reduction."
+
+```{r warning=F}
+l_data$olre <- factor(row(l_data)[,1])
+l_bin <- glmer(PAA/Control~(1|Strain)+(1|Condition)+(1|Strain:Condition)+(1|olre),
+          weights=Control,
+          family=binomial(link="log"),
+          control=glmerControl(optimizer="Nelder_Mead"),
+          data=l_data)
+
+# Extract BLUPs and intercept from model
+l_strain_effs <- ranef(l_bin)$Strain %>% tibble::rownames_to_column(var="Strain")
+l_condition_effs <- ranef(l_bin)$Condition %>% tibble::rownames_to_column(var="Condition")
+l_int_effs <- ranef(l_bin)$`Strain:Condition` %>% tibble::rownames_to_column(var="Int")
+l_intercept <- fixef(l_bin)[1]
+
+# Compute BLUP of "log-reduction"
+l_blups <- l_data %>%
+  select(Strain,Condition) %>%
+  mutate(Int=paste(Strain,Condition,sep=":")) %>%
+  distinct() %>%
+  left_join(l_strain_effs,by="Strain") %>% rename(strain_eff=`(Intercept)`) %>%
+  left_join(l_condition_effs,by="Condition") %>% rename(condition_eff=`(Intercept)`) %>%
+  left_join(l_int_effs,by="Int") %>% rename(int_eff=`(Intercept)`) %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         Int=factor(Int)) %>%
+  mutate(intercept=l_intercept) %>%
+  mutate(BLUP=log10(exp(1))*(-intercept-strain_eff-condition_eff-int_eff))
+
+# Add zeroes for plotting
+l_blups <- l_data %>% 
+  group_by(Strain,Condition) %>%
+  summarize(zeroes=sum(PAA==0)) %>%
+  left_join(l_blups,by=c("Strain","Condition")) %>%
+  ungroup()
+```
+
+Giving this model:
+```{r}
+summary(l_bin)
+```
+
+With the following CIs for variance components:
+```{r warning=F}
+#confint(l_bin) %>%
+#  kable()
+```
+
+This gives us the following BLUPs:
+```{r}
+l_strain_effs %>%
+  mutate(`(Intercept)`=log10(exp(1))*`(Intercept)`) %>%
+  kable()
+
+l_condition_effs %>%
+  mutate(`(Intercept)`=log10(exp(1))*`(Intercept)`) %>%
+  kable()
+
+l_int_effs %>%
+  mutate(`(Intercept)`=log10(exp(1))*`(Intercept)`) %>%
+  kable()
+```
+
+## Plotting the results
+
+```{r}
+l_blups %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,BLUP,zeroes) %>%
+ggplot(aes(x=i_Strain,y=BLUP,color=Condition,linetype=Condition)) +
+  geom_line() +
+  geom_text(aes(label=zeroes)) +
+  ylim(0,6.5) +
+  labs(x="Strain",y="Binomial proportion model",title=expression(italic("Listeria"))) +
+  scale_x_continuous(breaks=1:length(levels(factor(l_blups$Strain))),
+                     labels=levels(factor(l_blups$Strain))) +
+  theme_bw()
+```
+
+Compare to the mean estimates (with detection limit substituted where sanitizer
+count is zero)
+
+```{r}
+l_data_w_surrogate %>%
+  mutate(reduc=ifelse(is.infinite(reduc),right_censor_limit_reduc,reduc)) %>%
+  group_by(Strain,Condition) %>%
+  summarize(mean=mean(reduc)) %>%
+  ungroup() %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,mean) %>%
+ggplot(aes(x=i_Strain,y=mean,color=Condition,linetype=Condition)) +
+  geom_line() +
+  geom_point() +
+  labs(x="Strain",y="Mean",title="Listeria") +
+  ylim(0,6.5) +
+  scale_x_continuous(breaks=1:length(levels(factor(l_data_w_surrogate$Strain))),
+                     labels=levels(factor(l_data_w_surrogate$Strain))) +
+  theme_bw()
+```
+
+Looking at this the other way:
+
+```{r}
+l_blups %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,BLUP,zeroes) %>%
+ggplot(aes(x=i_Condition,y=BLUP,color=Strain,linetype=Strain)) +
+  geom_line() +
+  geom_text(aes(label=zeroes)) +
+  ylim(0,6.5) +
+  labs(x="Condition",y="Binomial proportion model",title="Listeria") +
+  scale_x_continuous(breaks=1:length(levels(factor(l_blups$Condition))),
+                     labels=levels(factor(l_blups$Condition))) +
+  theme_bw()
+```
+
+Compare to the mean estimates (with detection limit substituted where sanitizer
+count is zero)
+
+```{r}
+
+l_data_w_surrogate %>%
+  mutate(reduc=ifelse(is.infinite(reduc),right_censor_limit_reduc,reduc)) %>%
+  group_by(Strain,Condition) %>%
+  summarize(mean=mean(reduc)) %>%
+  ungroup() %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,mean) %>%
+ggplot(aes(x=i_Condition,y=mean,linetype=Strain, pch=Strain)) +
+  geom_line(size=1) +
+    geom_point(size=2.5) +
+  labs(x="Condition",y="log reduction CFU/mL",title=expression(italic("Listeria")))+
+  ylim(0,9) +
+  scale_x_continuous(breaks=1:length(levels(factor(l_data_w_surrogate$Condition))),
+                     labels=levels(factor(l_data_w_surrogate$Condition))) +
+  theme_bw(base_size = 20)
+
+```
+
+
+## Prediction intervals
+
+```{r}
+# This seems more direct, but I'm not sure how to handle conditioning on a random effect
+#l_newdat <- unique(l_data[,c("Strain","Condition")])
+#mm<-model.matrix(~1,l_newdat)
+#y<-mm%*%fixef(l_bin)
+#pvar1 <- diag(mm %*% tcrossprod(vcov(l_bin),mm))
+#tvar1 <- pvar1 + VarCorr(l_bin)$olre[1] + VarCorr(l_bin)$`Strain:Condition`[1] +
+#  VarCorr(l_bin)$Condition[1] + VarCorr(l_bin)$Strain[1]
+#l_newdat <- data.frame(
+#  y=exp(y),
+#  plo = -log10(exp(y-1.96*sqrt(pvar1))),
+#  phi = -log10(exp(y+1.96*sqrt(pvar1))),
+#  tlo = -log10(exp(y-1.96*sqrt(tvar1))),
+#  thi = -log10(exp(y+1.96*sqrt(tvar1)))
+#)
+```
+
+```{r}
+mu <- l_bin@beta[1]
+sds <- l_bin@theta
+l_lin_pred_overall <- function(x) {
+  -log10(exp(mu + 
+        rnorm(1,0,sds[1]) +
+        rnorm(1,0,sds[2]) +
+        rnorm(1,0,sds[3]) +
+        rnorm(1,0,sds[4])))
+}
+l_overall_sim <- data.frame(fixed_feature="None",
+           fixed="None",
+           sim=unlist(lapply(1:1e4,FUN=l_lin_pred_overall)))
+
+l_lin_pred_strain_fixed <- function(x,strain) {
+  -log10(exp(mu + 
+        rnorm(1,0,sds[1]) +
+        rnorm(1,0,sds[2]) +
+        rnorm(1,0,sds[3]) +
+        strain))
+}
+l_strain_sim <- data.frame(fixed_feature=NULL,
+                     fixed=NULL,
+                     sim=NULL)
+for( s in l_strain_effs$Strain ) {
+  tmp <- data.frame(fixed_feature="Strain",
+                    fixed=s,
+                    sim=unlist(
+                      lapply(1:1e4,
+                             FUN=l_lin_pred_strain_fixed,
+                             strain=l_strain_effs$`(Intercept)`[l_strain_effs$Strain==s])))
+  l_strain_sim <- rbind(l_strain_sim,tmp)
+}
+
+l_lin_pred_condition_fixed <- function(x,condition) {
+  -log10(exp(mu + 
+               rnorm(1,0,sds[1]) +
+               rnorm(1,0,sds[2]) +
+               condition +
+               rnorm(1,0,sds[4])))
+}
+l_condition_sim <- data.frame(fixed_feature=NULL,
+                     fixed=NULL,
+                     sim=NULL)
+for( s in l_condition_effs$Condition ) {
+  tmp <- data.frame(fixed_feature="Condition",
+                    fixed=s,
+                    sim=unlist(
+                      lapply(1:1e4,
+                             FUN=l_lin_pred_condition_fixed,
+                             condition=l_condition_effs$`(Intercept)`[l_condition_effs$Condition==s])))
+  l_condition_sim <- rbind(l_condition_sim,tmp)
+}
+
+l_pred <- rbind(l_overall_sim,
+                l_strain_sim,
+                l_condition_sim)
+l_pred %>%
+  group_by(fixed,fixed_feature) %>%
+  summarize(mean=mean(sim),
+            lower=quantile(sim,0.025),
+            upper=quantile(sim,0.975)) %>%
+ggplot(aes(x=fixed,y=mean)) +
+  geom_point() +
+ labs(x="fixed effects",y="Log reduction CFU/mL",title=expression(italic("L. monocytogenes"))) +
+  geom_errorbar(aes(ymin=lower,ymax=upper),width=0.2) +
+  facet_grid(~fixed_feature,scales = "free") +
+  theme(axis.text.x=element_text(angle = 45,hjust=1))
+```
+
+# Salmonella model
+
+```{r}
+s_data <- san %>%
+  filter(Strain!="FSL R9-5275") %>% # remove surrogate?
+  filter(Strain!="FSL R9-6232") %>% # remove surrogate?
+  filter(PathogenGroup=="Salmonella")
+# Substitute control count where PAA count was higher
+s_data$PAA <- pmin(s_data$PAA,s_data$Control-1)
+s_data_w_surrogate <- san %>%
+  filter(PathogenGroup=="Salmonella")
+```
+
+## Fit binomial proportion model
+
+We'll fit a crossed random-effects log-link binomial proportion model (with OLRE
+to correct for overdispersion) to the response
+$\log(N_{\text{san}}/N_{\text{cont}})$, the negative of which is our
+"log-reduction."
+
+```{r warning=F}
+s_data$olre <- factor(row(s_data)[,1])
+s_bin <- glmer(PAA/Control~(1|Strain)+(1|Condition)+(1|Strain:Condition)+(1|olre),
+          weights=Control,
+          family=binomial(link="log"),
+          #control=glmerControl(optimizer="Nelder_Mead"),
+          data=s_data)
+
+# Extract BLUPs and intercept from model
+s_strain_effs <- ranef(s_bin)$Strain %>% tibble::rownames_to_column(var="Strain")
+s_condition_effs <- ranef(s_bin)$Condition %>% tibble::rownames_to_column(var="Condition")
+s_int_effs <- ranef(s_bin)$`Strain:Condition` %>% tibble::rownames_to_column(var="Int")
+s_intercept <- fixef(s_bin)[1]
+
+# Compute BLUP of "log-reduction"
+s_blups <- s_data %>%
+  select(Strain,Condition) %>%
+  mutate(Int=paste(Strain,Condition,sep=":")) %>%
+  distinct() %>%
+  left_join(s_strain_effs,by="Strain") %>% rename(strain_eff=`(Intercept)`) %>%
+  left_join(s_condition_effs,by="Condition") %>% rename(condition_eff=`(Intercept)`) %>%
+  left_join(s_int_effs,by="Int") %>% rename(int_eff=`(Intercept)`) %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         Int=factor(Int)) %>%
+  mutate(intercept=s_intercept) %>%
+  mutate(BLUP=log10(exp(1))*(-intercept-strain_eff-condition_eff-int_eff))
+
+# Add zeroes for plotting
+s_blups <- s_data %>% 
+  group_by(Strain,Condition) %>%
+  summarize(zeroes=sum(PAA==0)) %>%
+  left_join(s_blups,by=c("Strain","Condition")) %>%
+  ungroup()
+```
+
+Giving this model:
+```{r}
+summary(s_bin)
+```
+
+With the following CIs for variance components:
+```{r warning=F}
+confint(s_bin,method="boot",nsim=100) %>%
+  kable()
+```
+
+This gives us the following BLUPs:
+```{r}
+s_strain_effs %>%
+  mutate(`(Intercept)`=log10(exp(1))*`(Intercept)`) %>%
+  kable()
+
+s_condition_effs %>%
+  mutate(`(Intercept)`=log10(exp(1))*`(Intercept)`) %>%
+  kable()
+
+s_int_effs %>%
+  mutate(`(Intercept)`=log10(exp(1))*`(Intercept)`) %>%
+  kable()
+```
+
+## Plotting the results
+
+```{r}
+s_blups %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,BLUP,zeroes) %>%
+ggplot(aes(x=i_Strain,y=BLUP,color=Condition,linetype=Condition)) +
+  geom_line() +
+  geom_text(aes(label=zeroes)) +
+  ylim(0,9) +
+  labs(x="Strain",y="Binomial proportion model",title="Salmonella") +
+  scale_x_continuous(breaks=1:length(levels(factor(s_blups$Strain))),
+                     labels=levels(factor(s_blups$Strain))) +
+  theme_bw()
+```
+
+Compare to the mean estimates (with detection limit substituted where sanitizer
+count is zero)
+
+```{r}
+s_data_w_surrogate %>%
+  mutate(reduc=ifelse(is.infinite(reduc),right_censor_limit_reduc,reduc)) %>%
+  group_by(Strain,Condition) %>%
+  summarize(mean=mean(reduc)) %>%
+  ungroup() %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,mean) %>%
+ggplot(aes(x=i_Strain,y=mean,color=Condition,linetype=Condition)) +
+  geom_line() +
+  geom_point() +
+  labs(x="Strain",y="Mean",title="Salmonella") +
+  ylim(0,9) +
+  scale_x_continuous(breaks=1:length(levels(factor(s_data$Strain))),
+                     labels=levels(factor(s_data$Strain))) +
+  theme_bw()
+```
+
+Looking at this the other way:
+
+```{r}
+s_blups %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,BLUP,zeroes) %>%
+ggplot(aes(x=i_Condition,y=BLUP,color=Strain,linetype=Strain)) +
+  geom_line() +
+  geom_text(aes(label=zeroes)) +
+  ylim(0,9) +
+  labs(x="Condition",y="Binomial proportion model",title="Salmonella") +
+  scale_x_continuous(breaks=1:length(levels(factor(s_blups$Condition))),
+                     labels=levels(factor(s_blups$Condition))) +
+  theme_bw()
+```
+
+Compare to the mean estimates (with detection limit substituted where sanitizer
+count is zero)
+
+```{r}
+s_data_w_surrogate %>%
+  mutate(reduc=ifelse(is.infinite(reduc),right_censor_limit_reduc,reduc)) %>%
+  group_by(Strain,Condition) %>%
+  summarize(mean=mean(reduc)) %>%
+  ungroup() %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,mean) %>%
+ggplot(aes(x=i_Condition,y=mean,linetype=Strain, pch=Strain)) +
+  geom_line(size=1) +
+  geom_point(size=2.5) +
+  labs(x="Condition",y="Log reduction CFU/mL",title=expression(italic("Salmonella"))) +
+  ylim(0,9) +
+  scale_x_continuous(breaks=1:length(levels(factor(s_data$Condition))),
+                     labels=levels(factor(s_data$Condition))) +
+  theme_bw(base_size = 20)
+```
+
+## Prediction intervals
+
+```{r}
+mu <- s_bin@beta[1]
+sds <- s_bin@theta
+s_lin_pred_overall <- function(x) {
+  -log10(exp(mu + 
+        rnorm(1,0,sds[1]) +
+        rnorm(1,0,sds[2]) +
+        rnorm(1,0,sds[3]) +
+        rnorm(1,0,sds[4])))
+}
+s_overals_sim <- data.frame(fixed_feature="None",
+           fixed="None",
+           sim=unlist(lapply(1:1e4,FUN=s_lin_pred_overall)))
+
+s_lin_pred_strain_fixed <- function(x,strain) {
+  -log10(exp(mu + 
+        rnorm(1,0,sds[1]) +
+        rnorm(1,0,sds[2]) +
+        rnorm(1,0,sds[3]) +
+        strain))
+}
+s_strain_sim <- data.frame(fixed_feature=NULL,
+                     fixed=NULL,
+                     sim=NULL)
+for( s in s_strain_effs$Strain ) {
+  tmp <- data.frame(fixed_feature="Strain",
+                    fixed=s,
+                    sim=unlist(
+                      lapply(1:1e4,
+                             FUN=s_lin_pred_strain_fixed,
+                             strain=s_strain_effs$`(Intercept)`[s_strain_effs$Strain==s])))
+  s_strain_sim <- rbind(s_strain_sim,tmp)
+}
+
+s_lin_pred_condition_fixed <- function(x,condition) {
+  -log10(exp(mu + 
+               rnorm(1,0,sds[1]) +
+               rnorm(1,0,sds[2]) +
+               condition +
+               rnorm(1,0,sds[4])))
+}
+s_condition_sim <- data.frame(fixed_feature=NULL,
+                     fixed=NULL,
+                     sim=NULL)
+for( s in s_condition_effs$Condition ) {
+  tmp <- data.frame(fixed_feature="Condition",
+                    fixed=s,
+                    sim=unlist(
+                      lapply(1:1e4,
+                             FUN=s_lin_pred_condition_fixed,
+                             condition=s_condition_effs$`(Intercept)`[s_condition_effs$Condition==s])))
+  s_condition_sim <- rbind(s_condition_sim,tmp)
+}
+
+s_pred <- rbind(s_overals_sim,
+                s_strain_sim,
+                s_condition_sim)
+s_pred %>%
+  group_by(fixed,fixed_feature) %>%
+  summarize(mean=mean(sim),
+            lower=quantile(sim,0.025),
+            upper=quantile(sim,0.975)) %>%
+ggplot(aes(x=fixed,y=mean)) +
+  geom_point() +
+ labs(x="fixed effects",y="Log reduction CFU/mL",title=expression(italic("Salmonella"))) +
+  geom_errorbar(aes(ymin=lower,ymax=upper),width=0.2) +
+  facet_grid(~fixed_feature,scales = "free") +
+  theme(axis.text.x=element_text(angle = 45,hjust=1))
+```
+
+# E. coli model
+
+```{r}
+e_data <- san %>%
+  filter(Strain!="FSL R9-4077") %>% # remove surrogate?
+  filter(PathogenGroup=="Escherichia coli")
+e_data_w_surrogate <- san %>%
+  filter(PathogenGroup=="Escherichia coli")
+```
+
+## Fit binomial proportion model
+
+We'll fit a crossed random-effects log-link binomial proportion model (with OLRE
+to correct for overdispersion) to the response
+$\log(N_{\text{san}}/N_{\text{cont}})$, the negative of which is our
+"log-reduction."
+
+```{r warning=F}
+e_data$olre <- factor(row(e_data)[,1])
+e_bin <- glmer(PAA/Control~(1|Strain)+(1|Condition)+(1|Strain:Condition)+(1|olre),
+          weights=Control,
+          family=binomial(link="log"),
+          #control=glmerControl(optimizer="Nelder_Mead"),
+          data=e_data)
+
+# Extract BLUPs and intercept from model
+e_strain_effs <- ranef(e_bin)$Strain %>% tibble::rownames_to_column(var="Strain")
+e_condition_effs <- ranef(e_bin)$Condition %>% tibble::rownames_to_column(var="Condition")
+e_int_effs <- ranef(e_bin)$`Strain:Condition` %>% tibble::rownames_to_column(var="Int")
+e_intercept <- fixef(e_bin)[1]
+
+# Compute BLUP of "log-reduction"
+e_blups <- e_data %>%
+  select(Strain,Condition) %>%
+  mutate(Int=paste(Strain,Condition,sep=":")) %>%
+  distinct() %>%
+  left_join(e_strain_effs,by="Strain") %>% rename(strain_eff=`(Intercept)`) %>%
+  left_join(e_condition_effs,by="Condition") %>% rename(condition_eff=`(Intercept)`) %>%
+  left_join(e_int_effs,by="Int") %>% rename(int_eff=`(Intercept)`) %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         Int=factor(Int)) %>%
+  mutate(intercept=e_intercept) %>%
+  mutate(BLUP=log10(exp(1))*(-intercept-strain_eff-condition_eff-int_eff))
+
+# Add zeroes for plotting
+e_blups <- e_data %>% 
+  group_by(Strain,Condition) %>%
+  summarize(zeroes=sum(PAA==0)) %>%
+  left_join(e_blups,by=c("Strain","Condition")) %>%
+  ungroup()
+```
+
+Giving this model:
+```{r}
+summary(e_bin)
+```
+
+With the following CIs for variance components:
+```{r warning=F}
+confint(e_bin,method="boot",nsim=100) %>%
+  kable()
+```
+
+This gives us the following BLUPs:
+```{r}
+e_strain_effs %>%
+  mutate(`(Intercept)`=log10(exp(1))*`(Intercept)`) %>%
+  kable()
+
+e_condition_effs %>%
+  mutate(`(Intercept)`=log10(exp(1))*`(Intercept)`) %>%
+  kable()
+
+e_int_effs %>%
+  mutate(`(Intercept)`=log10(exp(1))*`(Intercept)`) %>%
+  kable()
+```
+
+## Plotting the results
+
+```{r}
+e_blups %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,BLUP,zeroes) %>%
+ggplot(aes(x=i_Strain,y=BLUP,color=Condition,linetype=Condition)) +
+  geom_line() +
+  geom_text(aes(label=zeroes)) +
+  ylim(0,9) +
+  labs(x="Strain",y="Binomial proportion model",title="E. coli") +
+  scale_x_continuous(breaks=1:length(levels(factor(e_blups$Strain))),
+                     labels=levels(factor(e_blups$Strain))) +
+  theme_bw()
+```
+
+Compare to the mean estimates (with detection limit substituted where sanitizer
+count is zero)
+
+```{r}
+e_data_w_surrogate %>%
+  mutate(reduc=ifelse(is.infinite(reduc),right_censor_limit_reduc,reduc)) %>%
+  group_by(Strain,Condition) %>%
+  summarize(mean=mean(reduc)) %>%
+  ungroup() %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,mean) %>%
+ggplot(aes(x=i_Strain,y=mean,color=Condition,linetype=Condition)) +
+  geom_line() +
+  geom_point() +
+  labs(x="Strain",y="Mean",title="E. coli") +
+  ylim(0,9) +
+  scale_x_continuous(breaks=1:length(levels(factor(e_data$Strain))),
+                     labels=levels(factor(e_data$Strain))) +
+  theme_bw()
+```
+
+Looking at this the other way:
+
+```{r}
+e_blups %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,BLUP,zeroes) %>%
+ggplot(aes(x=i_Condition,y=BLUP,color=Strain,linetype=Strain)) +
+  geom_line() +
+  geom_text(aes(label=zeroes)) +
+  ylim(0,9) +
+  labs(x="Condition",y="Binomial proportion model",title="E. coli") +
+  scale_x_continuous(breaks=1:length(levels(factor(e_blups$Condition))),
+                     labels=levels(factor(e_blups$Condition))) +
+  theme_bw()
+```
+
+Compare to the mean estimates (with detection limit substituted where sanitizer
+count is zero)
+
+```{r}
+e_data_w_surrogate %>%
+  mutate(reduc=ifelse(is.infinite(reduc),right_censor_limit_reduc,reduc)) %>%
+  group_by(Strain,Condition) %>%
+  summarize(mean=mean(reduc)) %>%
+  ungroup() %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,mean) %>%
+ggplot(aes(x=i_Condition,y=mean,linetype=Strain, pch=Strain)) +
+  geom_line(size=1) +
+geom_point(size=2.5) +
+  labs(x="Condition",y="Log reduction CFU/mL",title=expression(italic("E. coli"))) +
+  ylim(0,9) +
+  scale_x_continuous(breaks=1:length(levels(factor(e_data$Condition))),
+              labels=levels(factor(e_data$Condition))) +
+  theme_bw(base_size = 20)
+```
+
+Lets try making a bar graph
+
+```{r}
+e_data_w_surrogate %>%
+  mutate(reduc=ifelse(is.infinite(reduc),right_censor_limit_reduc,reduc)) %>%
+  group_by(Strain,Condition) %>%
+  summarize(mean=mean(reduc)) %>%
+  ungroup() %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,mean) %>%
+ggplot(aes(x=i_Condition,y=mean, fill=factor(Strain))) +
+geom_bar(stat="identity", position = "dodge")+
+  labs(x="Condition",y="Log reduction CFU/mL",title=expression(italic("E. coli"))) +
+  ylim(0,9) +
+   scale_fill_discrete(name="Strain",
+                      breaks=c(1, 2,3,4,5,6),
+                      labels=c("FSL R9-5258", "FSL R9-5271", "FSL R9-5515", "FSL R9-55516", "FSL R9-5517", "TVS 353"))+
+  scale_x_continuous(breaks=1:length(levels(factor(e_data$Condition))),
+    labels=levels(factor(e_data$Condition))) +
+  theme_bw(base_size = 15)
+
+##another graph with jitter?
+
+e_data_w_surrogate %>%
+  mutate(reduc=ifelse(is.infinite(reduc),right_censor_limit_reduc,reduc)) %>%
+  #group_by(Strain,Condition) %>%
+  #summarize(mean=mean(reduc)) %>%
+  #ungroup() %>%
+  mutate(Strain=factor(Strain),
+         Condition=factor(Condition),
+         i_Strain=as.integer(Strain),
+         i_Condition=as.integer(Condition)) %>%
+  select(Strain,Condition,i_Strain,i_Condition,reduc) %>%
+ggplot(aes(x=i_Condition,y=reduc, color=Strain)) +
+geom_jitter()+
+  labs(x="Condition",y="Log reduction CFU/mL",title=expression(italic("E. coli"))) +
+  ylim(0,9) +
+  scale_x_continuous(breaks=1:length(levels(factor(e_data$Condition))),
+              labels=levels(factor(e_data$Condition))) +
+  theme_bw(base_size = 20)
+
+
+```
+
+
+```{r}
+
+## Prediction intervals
+
+```{r}
+mu <- e_bin@beta[1]
+sds <- e_bin@theta
+e_lin_pred_overall <- function(x) {
+  -log10(exp(mu + 
+        rnorm(1,0,sds[1]) +
+        rnorm(1,0,sds[2]) +
+        rnorm(1,0,sds[3]) +
+        rnorm(1,0,sds[4])))
+}
+e_overale_sim <- data.frame(fixed_feature="None",
+           fixed="None",
+           sim=unlist(lapply(1:1e4,FUN=e_lin_pred_overall)))
+
+e_lin_pred_strain_fixed <- function(x,strain) {
+  -log10(exp(mu + 
+        rnorm(1,0,sds[1]) +
+        rnorm(1,0,sds[2]) +
+        rnorm(1,0,sds[3]) +
+        strain))
+}
+e_strain_sim <- data.frame(fixed_feature=NULL,
+                     fixed=NULL,
+                     sim=NULL)
+for( s in e_strain_effs$Strain ) {
+  tmp <- data.frame(fixed_feature="Strain",
+                    fixed=s,
+                    sim=unlist(
+                      lapply(1:1e4,
+                             FUN=e_lin_pred_strain_fixed,
+                             strain=e_strain_effs$`(Intercept)`[e_strain_effs$Strain==s])))
+  e_strain_sim <- rbind(e_strain_sim,tmp)
+}
+
+e_lin_pred_condition_fixed <- function(x,condition) {
+  -log10(exp(mu + 
+               rnorm(1,0,sds[1]) +
+               rnorm(1,0,sds[2]) +
+               condition +
+               rnorm(1,0,sds[4])))
+}
+e_condition_sim <- data.frame(fixed_feature=NULL,
+                     fixed=NULL,
+                     sim=NULL)
+for( s in e_condition_effs$Condition ) {
+  tmp <- data.frame(fixed_feature="Condition",
+                    fixed=s,
+                    sim=unlist(
+                      lapply(1:1e4,
+                             FUN=e_lin_pred_condition_fixed,
+                             condition=e_condition_effs$`(Intercept)`[e_condition_effs$Condition==s])))
+  e_condition_sim <- rbind(e_condition_sim,tmp)
+}
+
+e_pred <- rbind(e_overale_sim,
+                e_strain_sim,
+                e_condition_sim)
+e_pred %>%
+  group_by(fixed,fixed_feature) %>%
+  summarize(mean=mean(sim),
+            lower=quantile(sim,0.025),
+            upper=quantile(sim,0.975)) %>%
+ggplot(aes(x=fixed,y=mean)) +
+  geom_point() +
+labs(x="fixed effects",y="Log reduction CFU/mL",title="STEC") +
+  geom_errorbar(aes(ymin=lower,ymax=upper),width=0.2) +
+  facet_grid(~fixed_feature,scales = "free") +
+  theme(axis.text.x=element_text(angle = 45,hjust=1))
+```
+
